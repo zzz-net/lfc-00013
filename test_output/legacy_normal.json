@@ -1,0 +1,16 @@
+{
+  "config_version": 1,
+  "format": "csv",
+  "include_original": false,
+  "include_fields": [
+    "id",
+    "desensitized_text",
+    "status",
+    "final_conclusion",
+    "sample_batch"
+  ],
+  "exclude_fields": [
+    "source_file",
+    "rule_version"
+  ]
+}

@@ -1,0 +1,16 @@
+﻿{
+  "config_version": 1,
+  "format": "csv",
+  "include_fields": [
+    "id",
+    "desensitized_text",
+    "status",
+    "sample_batch",
+    "source_file"
+  ],
+  "exclude_fields": [
+    "status",
+    "sample_batch",
+    "created_at"
+  ]
+}

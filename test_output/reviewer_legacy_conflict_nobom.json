@@ -1,0 +1,16 @@
+{
+  "config_version": 1,
+  "include_original": false,
+  "include_fields": [
+    "id",
+    "desensitized_text",
+    "status",
+    "sample_batch",
+    "final_conclusion"
+  ],
+  "exclude_fields": [
+    "status",
+    "sample_batch",
+    "source_file"
+  ]
+}

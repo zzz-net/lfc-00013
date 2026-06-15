@@ -1,0 +1,12 @@
+{
+  "config_version": 1,
+  "include_original": true,
+  "include_fields": [
+    "id",
+    "desensitized_text"
+  ],
+  "exclude_fields": [
+    "original_text",
+    "status"
+  ]
+}

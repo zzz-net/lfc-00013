@@ -73,9 +73,11 @@ class ExportConfig:
     format: str = ExportFormat.CSV.value
     include_review_summary: bool = False
     field_policies: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_FIELD_POLICIES))
+    _migration_errors: List[str] = field(default_factory=list, repr=False)
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False, indent=2)
+        data = {k: v for k, v in asdict(self).items() if not k.startswith("_")}
+        return json.dumps(data, ensure_ascii=False, indent=2)
 
     @classmethod
     def from_json(cls, raw: str) -> "ExportConfig":
@@ -88,6 +90,8 @@ class ExportConfig:
         cfg.config_version = data.get("config_version", 1)
         cfg.format = data.get("format", ExportFormat.CSV.value)
         cfg.include_review_summary = data.get("include_review_summary", False)
+
+        cfg._migration_errors = list(_detect_legacy_field_conflicts(data))
 
         policies = data.get("field_policies")
         if policies is None:
@@ -116,6 +120,9 @@ class ExportConfig:
         """
         self._auto_sync_flags()
         errors: List[str] = []
+
+        if self._migration_errors:
+            errors.extend(self._migration_errors)
 
         if self.format not in (ExportFormat.CSV.value, ExportFormat.JSONL.value):
             errors.append(f"不支持的导出格式: {self.format}，必须是 csv 或 jsonl")
@@ -171,6 +178,46 @@ class ExportConfig:
             f"保留字段 ({len(fields)} 个): {', '.join(fields)}",
         ]
         return "\n".join(lines)
+
+
+def _detect_legacy_field_conflicts(data: dict) -> List[str]:
+    """检测旧配置中同一字段同时出现在 include_fields 和 exclude_fields 的冲突。
+
+    返回致命错误列表（非警告），发现冲突时阻止保存/导出。
+    """
+    errors: List[str] = []
+
+    legacy_include = data.get("include_fields") or data.get("fields")
+    legacy_exclude = data.get("exclude_fields")
+
+    include_set: set = set()
+    exclude_set: set = set()
+
+    if isinstance(legacy_include, list):
+        include_set = {str(f) for f in legacy_include if f in DEFAULT_FIELD_POLICIES}
+    if isinstance(legacy_exclude, list):
+        exclude_set = {str(f) for f in legacy_exclude if f in DEFAULT_FIELD_POLICIES}
+
+    overlap = sorted(include_set & exclude_set)
+    if overlap:
+        errors.append(
+            "旧配置字段冲突：字段 [" + ", ".join(overlap) + "] 同时出现在 include_fields/fields 和 exclude_fields 中；"
+            "请删除冲突项后再导入"
+        )
+
+    include_original = data.get("include_original")
+    if isinstance(include_original, bool) and not include_original and "original_text" in include_set:
+        errors.append(
+            "旧配置字段冲突：include_original=False 但 original_text 出现在 include_fields 中；"
+            "请保留一致的设置后再导入"
+        )
+    if isinstance(include_original, bool) and include_original and "original_text" in exclude_set:
+        errors.append(
+            "旧配置字段冲突：include_original=True 但 original_text 出现在 exclude_fields 中；"
+            "请保留一致的设置后再导入"
+        )
+
+    return errors
 
 
 def _migrate_legacy_field_flags(data: dict) -> Dict[str, str]:
@@ -333,22 +380,35 @@ def load_config(config_name: str = "default") -> Tuple[Optional[ExportConfig], L
 
 def import_config_from_file(file_path: str, target_name: str = "default",
                             operator: str = "system") -> Tuple[bool, List[str], List[str]]:
-    """从 JSON 文件导入配置"""
+    """从 JSON 文件导入配置。
+
+    - 使用 utf-8-sig 编码读取，自动兼容带 BOM 和无 BOM 的 UTF-8 文件
+    - 旧配置 (include_fields + exclude_fields) 存在字段交集时直接作为致命错误返回
+      （检测由 ExportConfig.from_dict → validate() 统一负责）
+    - 导入失败会写入 config_import_failed 审计日志
+    """
     if not os.path.exists(file_path):
         return False, [f"配置文件不存在: {file_path}"], []
 
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
             raw = json.load(f)
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        log_operation(
+            operation='config_import_failed',
+            operator=operator,
+            details=f"导入配置文件 [{os.path.basename(file_path)}] 失败: 文件读取/JSON 解析错误: {e}",
+            rule_version=0,
+        )
         return False, [f"配置文件读取失败: {e}"], []
 
     compat = detect_legacy_compat_issues(raw)
     config = ExportConfig.from_dict(raw)
 
     valid, errors = config.validate()
-    fatal = [e for e in errors if "安全提示" not in e]
-    safety = [e for e in errors if "安全提示" in e]
+    fatal = [e for e in errors if "安全提示" not in e and "兼容提示" not in e]
+    safety = [e for e in errors if "安全提示" in e or "兼容提示" in e]
+
     warnings = compat + safety
 
     if fatal:
