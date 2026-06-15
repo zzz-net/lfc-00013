@@ -13,6 +13,12 @@
 10. 撤销后实际导出结果跟着切回
 11. 审计日志记录
 12. 发布单历史记录
+
+可复用测试夹具（见 release_test_fixtures 区域）：
+  - setup_test_env         重置 DB + 初始化 + 准备命名配置
+  - build_export_file      导出一个发布单到临时 JSON 文件（供导入测试复用）
+  - assert_import_blocked  断言导入被某类冲突拦截且不落库 draft
+  - assert_audit_has_op    断言审计日志中存在某操作
 """
 import os
 import sys
@@ -24,6 +30,10 @@ import shutil
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, "data", "corpus.db")
 
+
+# ============================================================
+# release_test_fixtures：可复用测试夹具
+# ============================================================
 
 def reset_db():
     if os.path.exists(DB_PATH):
@@ -38,14 +48,12 @@ def check(cond, msg):
     return False
 
 
-def main():
-    print("=" * 70)
-    print("导出配置发布单模块测试")
-    print("=" * 70)
+def setup_test_env():
+    """初始化数据库并准备多个命名配置，供各测试场景复用。
 
+    返回：(ec_module, ro_module, desensitizer_module, exporter_module, audit_module)
+    """
     reset_db()
-    all_pass = True
-
     from corpus_tool.database import init_db, ensure_default_rules
     from corpus_tool import release_orders as ro
     from corpus_tool import export_config as ec
@@ -56,23 +64,116 @@ def main():
     init_db()
     ensure_default_rules()
 
-    # ---- 1. 准备测试数据：创建多个命名配置 ----
-    print("\n--- 准备测试数据 ---")
-
     ec.set_active_config("default", operator="admin")
 
     cfg_prod = ec.ExportConfig()
     cfg_prod.format = ec.ExportFormat.CSV.value
     cfg_prod.field_policies["original_text"] = ec.FieldPolicy.DROP.value
-    ok, errs, warns = ec.save_config(cfg_prod, "prod_config", operator="admin")
-    all_pass &= check(ok, "创建 prod_config 配置")
+    ec.save_config(cfg_prod, "prod_config", operator="admin")
 
     cfg_test = ec.ExportConfig()
     cfg_test.format = ec.ExportFormat.JSONL.value
     cfg_test.field_policies["original_text"] = ec.FieldPolicy.DROP.value
     cfg_test.include_review_summary = True
-    ok, errs, warns = ec.save_config(cfg_test, "test_config", operator="admin")
-    all_pass &= check(ok, "创建 test_config 配置")
+    ec.save_config(cfg_test, "test_config", operator="admin")
+
+    return ec, ro, desensitizer, exporter, get_audit_logs
+
+
+def build_export_file(ro, ec, tmpdir, order_name="RO-FIXTURE",
+                      source="default", target="fixture_target",
+                      config_overrides=None):
+    """创建一个发布单、按可选覆写修改配置、导出为 JSON 文件。
+
+    返回：(order_object, export_file_path)
+    """
+    order = ro.create_release_order(
+        order_name,
+        source_config_name=source,
+        target_config_name=target,
+        description="夹具生成的发布单",
+        operator="tester"
+    )
+    if config_overrides:
+        order = ro.update_draft_config(order.id, operator="tester", **config_overrides)
+    export_file = os.path.join(tmpdir, f"{order_name}.json")
+    ro.export_release_order(order.id, export_file, operator="admin")
+    return order, export_file
+
+
+def _count_draft_orders(ro, name_filter=None):
+    """统计当前 draft 状态的发布单数量（用于验证冲突拦截不会落库）。"""
+    orders = ro.list_release_orders()
+    if name_filter:
+        return sum(1 for o in orders if o.status == "draft" and o.name == name_filter)
+    return sum(1 for o in orders if o.status == "draft")
+
+
+def assert_import_blocked(ro, export_file, operator, expected_keywords,
+                          rename_to=None, force=False, order_name=None):
+    """断言导入被拦截，并且数据库中没有新增 draft。
+
+    参数：
+      ro                - release_orders 模块
+      export_file       - 待导入的 JSON 文件路径
+      operator          - 操作人
+      expected_keywords - 错误消息中应包含的关键词列表（任一命中即算匹配）
+      rename_to         - 可选重命名
+      force             - 是否 force
+      order_name        - 导入后的目标发布单名称（用于统计 draft 数量）
+    """
+    draft_before = _count_draft_orders(ro)
+    target_name = order_name or rename_to
+    if target_name:
+        target_before = _count_draft_orders(ro, name_filter=target_name)
+
+    caught = False
+    try:
+        ro.import_release_order(export_file, operator=operator,
+                                rename_to=rename_to, force=force)
+    except ValueError as e:
+        msg = str(e)
+        matched = any(kw in msg for kw in expected_keywords)
+        if not matched:
+            print(f"[WARN] 拦截消息缺少期望关键词: msg={msg!r}, expected={expected_keywords}")
+        caught = matched
+
+    draft_after = _count_draft_orders(ro)
+    no_leak = (draft_after == draft_before)
+    if target_name:
+        target_after = _count_draft_orders(ro, name_filter=target_name)
+        no_leak = no_leak and (target_after == target_before)
+
+    return check(caught and no_leak,
+                 f"导入被正确拦截（关键词={expected_keywords}）且无 draft 泄漏")
+
+
+def assert_audit_has_op(get_audit_logs_fn, operation, limit=300,
+                        detail_contains=None):
+    """断言审计日志中存在指定操作（可选详情关键词）。"""
+    logs = get_audit_logs_fn(limit=limit)
+    matched = [l for l in logs if l.operation == operation]
+    if detail_contains:
+        matched = [l for l in matched if detail_contains in l.details]
+    return check(len(matched) > 0,
+                 f"审计日志包含操作 [{operation}]"
+                 + (f"（详情含 '{detail_contains}'）" if detail_contains else ""))
+
+
+# ============================================================
+# 测试主流程
+# ============================================================
+
+def main():
+    print("=" * 70)
+    print("导出配置发布单模块测试")
+    print("=" * 70)
+
+    ec, ro, desensitizer, exporter, get_audit_logs = setup_test_env()
+    all_pass = True
+
+    # ---- 1. 准备测试数据：确认基础配置就绪 ----
+    print("\n--- 准备测试数据 ---")
 
     configs = ec.list_configs()
     all_pass &= check(len(configs) >= 3, "至少有 3 个配置方案 (default, prod_config, test_config)")
@@ -422,25 +523,21 @@ def main():
     except Exception as e:
         all_pass &= check(False, f"撤销后导出失败: {e}")
 
-    # ---- 10. 导入导出 JSON 往返 ----
+    # ---- 10. 导入导出 JSON 往返（使用可复用夹具） ----
     print("\n--- 测试导入导出 JSON 往返 ---")
 
-    order4 = ro.create_release_order(
-        "RO-004",
-        source_config_name="test_config",
-        target_config_name="new_config",
-        description="用于导入导出测试的发布单",
-        operator="tester"
+    order4, export_file = build_export_file(
+        ro, ec, tmpdir,
+        order_name="RO-004",
+        source="test_config",
+        target="new_config",
+        config_overrides={
+            "format": "jsonl",
+            "field_policies": {"created_at": ec.FieldPolicy.KEEP.value},
+        }
     )
-    order4 = ro.update_draft_config(
-        order4.id,
-        format="jsonl",
-        field_policies={"created_at": ec.FieldPolicy.KEEP.value},
-        operator="tester"
-    )
+    order4_desc = "用于导入导出测试的发布单"
 
-    export_file = os.path.join(tmpdir, "release_order_ro004.json")
-    ro.export_release_order(order4.id, export_file, operator="admin")
     all_pass &= check(os.path.exists(export_file), "发布单文件已导出")
 
     with open(export_file, 'r', encoding='utf-8') as f:
@@ -450,11 +547,11 @@ def main():
     all_pass &= check("config" in export_data, "导出文件包含 config")
     all_pass &= check("history" in export_data, "导出文件包含 history")
 
-    try:
-        ro.import_release_order(export_file, operator="admin")
-        all_pass &= check(False, "同名发布单导入应被拒绝但未被拒绝")
-    except ValueError as e:
-        all_pass &= check("已存在" in str(e), "同名发布单导入被正确拒绝")
+    all_pass &= assert_import_blocked(
+        ro, export_file, operator="admin",
+        expected_keywords=["已存在"],
+        order_name="RO-004"
+    )
 
     imported = ro.import_release_order(
         export_file, operator="admin", rename_to="RO-004-IMPORTED"
@@ -483,26 +580,131 @@ def main():
     bad_file = os.path.join(tmpdir, "bad_release.json")
     with open(bad_file, 'w', encoding='utf-8') as f:
         f.write("this is not valid json {{{")
-    try:
-        ro.import_release_order(bad_file, operator="admin")
-        all_pass &= check(False, "损坏文件导入应被拒绝但未被拒绝")
-    except ValueError as e:
-        all_pass &= check("读取失败" in str(e) or "JSON" in str(e),
-                          "损坏文件导入被正确拒绝")
+    all_pass &= assert_import_blocked(
+        ro, bad_file, operator="admin",
+        expected_keywords=["读取失败", "JSON"]
+    )
 
     bad_schema_file = os.path.join(tmpdir, "bad_schema.json")
     with open(bad_schema_file, 'w', encoding='utf-8') as f:
         json.dump({"schema_version": 999, "order_info": {}, "config": {}}, f)
-    try:
-        ro.import_release_order(bad_schema_file, operator="admin")
-        all_pass &= check(False, "版本不兼容应被拒绝但未被拒绝")
-    except ValueError as e:
-        all_pass &= check("不兼容" in str(e), "版本不兼容被正确拒绝")
+    all_pass &= assert_import_blocked(
+        ro, bad_schema_file, operator="admin",
+        expected_keywords=["不兼容"]
+    )
+
+    # ---- 10.5 导入冲突回归测试（使用可复用夹具） ----
+    print("\n--- 测试导入冲突回归（同名/激活漂移/旧版本/重启复现） ---")
+
+    # --- 场景 A：同名发布单冲突（force=True 可覆盖） ---
+    print("\n  [场景 A] 同名发布单冲突")
+    base_order, base_export = build_export_file(
+        ro, ec, tmpdir,
+        order_name="RO-CONFLICT-BASE",
+        source="default",
+        target="conflict_target",
+        config_overrides={"format": "jsonl"},
+    )
+    all_pass &= assert_import_blocked(
+        ro, base_export, operator="admin",
+        expected_keywords=["已存在"],
+        order_name="RO-CONFLICT-BASE",
+    )
+    imported_force = ro.import_release_order(
+        base_export, operator="admin", force=True
+    )
+    all_pass &= check(imported_force.name == "RO-CONFLICT-BASE",
+                      "force=True 可覆盖同名发布单")
+    ro.delete_release_order(imported_force.id, operator="admin")
+
+    # --- 场景 B：目标配置已存在 ---
+    print("\n  [场景 B] 目标配置已存在")
+    target_exists_order, target_exists_export = build_export_file(
+        ro, ec, tmpdir,
+        order_name="RO-TARGET-EXISTS",
+        source="default",
+        target="prod_config",
+    )
+    ro.delete_release_order(target_exists_order.id, operator="admin")
+    all_pass &= assert_import_blocked(
+        ro, target_exists_export, operator="admin",
+        expected_keywords=["目标配置", "已存在"],
+        order_name="RO-TARGET-EXISTS",
+    )
+    all_pass &= assert_audit_has_op(
+        get_audit_logs, "release_order_import_failed",
+        detail_contains="目标配置"
+    )
+
+    # --- 场景 C：激活配置被他人改动（漂移） ---
+    print("\n  [场景 C] 激活配置漂移")
+    ec.set_active_config("test_config", operator="admin")
+    drift_order, drift_export = build_export_file(
+        ro, ec, tmpdir,
+        order_name="RO-ACTIVE-DRIFT",
+        source="default",
+        target="test_config",
+    )
+    ro.delete_release_order(drift_order.id, operator="admin")
+    cfg_modified, _ = ec.load_config("test_config")
+    cfg_modified.field_policies["created_at"] = ec.FieldPolicy.KEEP.value
+    ec.save_config(cfg_modified, "test_config", operator="someone_else")
+    all_pass &= assert_import_blocked(
+        ro, drift_export, operator="admin",
+        expected_keywords=["激活配置", "已被修改"],
+        order_name="RO-ACTIVE-DRIFT",
+    )
+    all_pass &= assert_audit_has_op(
+        get_audit_logs, "release_order_import_failed",
+        detail_contains="激活配置"
+    )
+
+    # --- 场景 D：规则版本落后 ---
+    print("\n  [场景 D] 规则版本落后")
+    oldver_order, oldver_export = build_export_file(
+        ro, ec, tmpdir,
+        order_name="RO-OLD-VERSION",
+        source="default",
+        target="oldver_target",
+    )
+    ro.delete_release_order(oldver_order.id, operator="admin")
+    with open(oldver_export, 'r', encoding='utf-8') as f:
+        oldver_data = json.load(f)
+    oldver_data["order_info"]["rule_version"] = 0
+    with open(oldver_export, 'w', encoding='utf-8') as f:
+        json.dump(oldver_data, f, ensure_ascii=False, indent=2)
+    all_pass &= assert_import_blocked(
+        ro, oldver_export, operator="admin",
+        expected_keywords=["规则版本", "落后"],
+        order_name="RO-OLD-VERSION",
+    )
+    all_pass &= assert_audit_has_op(
+        get_audit_logs, "release_order_import_failed",
+        detail_contains="规则版本"
+    )
+
+    # --- 场景 E：重启后再次导入（先导入成功，再删 DB 模拟重启，再导入同名应正常） ---
+    print("\n  [场景 E] 重启后再次导入")
+    restart_order, restart_export = build_export_file(
+        ro, ec, tmpdir,
+        order_name="RO-RESTART",
+        source="default",
+        target="restart_target",
+    )
+    ro.delete_release_order(restart_order.id, operator="admin")
+
+    imported_once = ro.import_release_order(restart_export, operator="admin")
+    all_pass &= check(imported_once.name == "RO-RESTART", "首次导入成功")
+    ro.delete_release_order(imported_once.id, operator="admin")
+
+    imported_again = ro.import_release_order(restart_export, operator="admin")
+    all_pass &= check(imported_again.name == "RO-RESTART",
+                      "删除后再次导入（模拟重启清理）成功")
 
     # ---- 11. 审计日志检查 ----
     print("\n--- 测试审计日志 ---")
 
-    logs = get_audit_logs(limit=200)
+    logs = get_audit_logs(limit=400)
     ops = {l.operation for l in logs}
 
     expected_ops = [
@@ -514,6 +716,7 @@ def main():
         "release_order_revert",
         "release_order_export",
         "release_order_import",
+        "release_order_import_failed",
         "release_order_create_failed",
         "release_order_approve_failed",
         "release_order_publish_failed",
@@ -524,6 +727,9 @@ def main():
             continue
         all_pass &= check(expected_op in ops,
                           f"审计日志包含 {expected_op} 操作")
+
+    all_pass &= check("release_order_import_failed" in ops,
+                      "审计日志包含 release_order_import_failed 操作")
 
     publish_logs = [l for l in logs if l.operation == "release_order_publish"]
     all_pass &= check(len(publish_logs) >= 2,
@@ -562,7 +768,7 @@ def main():
         all_pass &= check("published" in str(e) or "不能删除" in str(e),
                           "已发布的发布单删除被正确拒绝")
 
-    logs = get_audit_logs(limit=300)
+    logs = get_audit_logs(limit=400)
     ops = {l.operation for l in logs}
     all_pass &= check("release_order_delete" in ops,
                       "审计日志包含 release_order_delete 操作")

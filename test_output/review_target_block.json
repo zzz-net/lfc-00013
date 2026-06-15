@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "exported_at": "2026-06-15T19:25:15.152467",
+  "exported_by": "reviewer",
+  "order_info": {
+    "name": "REVIEW-TARGET-BLOCK",
+    "description": "",
+    "status": "draft",
+    "source_config_name": "default",
+    "target_config_name": "prod_config",
+    "rule_version": 1,
+    "approver": null,
+    "created_by": "reviewer",
+    "created_at": "2026-06-15T19:25:15.137891",
+    "approved_at": null,
+    "published_at": null
+  },
+  "config": {
+    "config_version": 2,
+    "format": "csv",
+    "include_review_summary": false,
+    "field_policies": {
+      "id": "keep",
+      "original_text": "drop",
+      "desensitized_text": "keep",
+      "source_file": "keep",
+      "status": "drop",
+      "rule_version": "keep",
+      "created_at": "drop",
+      "updated_at": "drop",
+      "is_sampled": "drop",
+      "sample_batch": "drop",
+      "final_conclusion": "keep",
+      "review_summary": "drop"
+    }
+  },
+  "history": [
+    {
+      "action": "create",
+      "operator": "reviewer",
+      "details": "创建发布单，源配置=[default], 目标配置=[prod_config]",
+      "created_at": "2026-06-15T19:25:15.143989"
+    }
+  ]
+}

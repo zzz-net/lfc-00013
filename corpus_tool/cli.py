@@ -1293,10 +1293,17 @@ def release_order_export(name_or_id, output_path, operator):
         sys.exit(1)
 
 
-@release_order.command("import", help="从 JSON 文件导入发布单")
+@release_order.command("import", help="""从 JSON 文件导入发布单
+
+冲突拦截规则（被拒绝时不会落成 draft）：
+  1. 同名发布单已存在：可通过 --force 覆盖
+  2. 目标配置已存在：一律拒绝（不可强制）
+  3. 激活配置被他人修改：一律拒绝（不可强制）
+  4. 发布单规则版本落后于当前：一律拒绝（不可强制，需重新导出）
+""")
 @click.argument('file_path', type=click.Path(exists=True))
 @click.option('--rename', default=None, help="重命名导入后的发布单")
-@click.option('--force', is_flag=True, help="覆盖已存在的同名发布单")
+@click.option('--force', is_flag=True, help="覆盖已存在的同名发布单（仅对同名冲突生效）")
 @click.option('--operator', default="admin", help="操作人")
 def release_order_import(file_path, rename, force, operator):
     try:

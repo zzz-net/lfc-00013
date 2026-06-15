@@ -10,11 +10,17 @@
 - 权限控制（管理员才能发布和撤销）
 - 审计日志
 - 数据持久化（重启可恢复）
+
+统一导入入口：
+  _prepare_import_context   - 解析文件并返回结构化上下文
+  _check_import_conflicts   - 三类冲突统一校验（目标配置已存在/激活配置漂移/规则版本落后）
+  _persist_imported_order   - 落库 + 历史 + 审计（供 create/import 等多处复用）
+  import_release_order      - 对外统一入口，串起以上三步
 """
 import json
 import os
 import re
-from dataclasses import asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import List, Optional, Dict, Tuple, Any
 
@@ -29,6 +35,29 @@ RELEASE_ORDER_SCHEMA_VERSION = 1
 
 
 ADMIN_ROLES = {"admin", "administrator"}
+
+
+@dataclass
+class ImportContext:
+    """导入过程的结构化上下文，用于在解析、校验、落库各阶段传递数据。"""
+    raw_data: Dict[str, Any]
+    order_name: str
+    source_config_name: str
+    target_config_name: str
+    description: str
+    rule_version: int
+    config: "ec.ExportConfig"
+    config_json: str
+    approver: Optional[str] = None
+    created_by: str = ""
+    created_at: str = ""
+    approved_at: Optional[str] = None
+    published_at: Optional[str] = None
+    history_data: List[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        if self.history_data is None:
+            self.history_data = []
 
 
 def _is_admin(operator: str) -> bool:
@@ -144,6 +173,13 @@ def _update_order_status(order_id: int, status: str, **kwargs) -> None:
 
 def create_release_order(name: str, source_config_name: str, target_config_name: str,
                       description: str = "", operator: str = "system") -> ReleaseOrder:
+    """创建发布单。
+
+    注意：创建发布单仅校验"发布单名称"和"源/目标配置合法性"，
+    不做三类冲突拦截（目标配置已存在/激活配置漂移/规则版本落后）。
+    这些冲突留到发布（publish_release_order）阶段统一拦截。
+    导入（import_release_order）阶段则会执行完整的三类冲突拦截。
+    """
     valid, name_errors = _validate_order_name(name)
     if not valid:
         log_operation(
@@ -179,6 +215,19 @@ def create_release_order(name: str, source_config_name: str, target_config_name:
 
     rule_version = _get_current_rule_version()
 
+    ctx = ImportContext(
+        raw_data={},
+        order_name=name,
+        source_config_name=source_config_name,
+        target_config_name=target_config_name,
+        description=description,
+        rule_version=rule_version,
+        config=src_cfg,
+        config_json=src_cfg.to_json(),
+        created_by=operator,
+        created_at=datetime.now().isoformat(),
+    )
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM release_orders WHERE name = ?", (name,))
@@ -191,37 +240,9 @@ def create_release_order(name: str, source_config_name: str, target_config_name:
             rule_version=0,
         )
         raise ValueError(f"发布单名称 [{name}] 已存在")
-
-    config_json = src_cfg.to_json()
-
-    cursor.execute('''
-        INSERT INTO release_orders
-        (name, description, status, source_config_name, target_config_name,
-         config_json, rule_version, created_by, created_at)
-        VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?)
-    ''', (name, description, source_config_name, target_config_name,
-          config_json, rule_version, operator, datetime.now().isoformat()))
-    order_id = cursor.lastrowid
-    conn.commit()
     conn.close()
 
-    _add_history(
-        order_id, "create", operator,
-        f"创建发布单，源配置=[{source_config_name}], 目标配置=[{target_config_name}]",
-        to_config=config_json
-    )
-
-    log_operation(
-        operation='release_order_create',
-        operator=operator,
-        details=(
-            f"创建发布单 [{name}]：源配置=[{source_config_name}], "
-            f"目标配置=[{target_config_name}], 规则版本=v{rule_version}"
-        ),
-        rule_version=rule_version,
-    )
-
-    return get_release_order(order_id)
+    return _persist_imported_order(ctx, operator=operator, force=False, source_file=None)
 
 
 def list_release_orders(status: Optional[str] = None) -> List[ReleaseOrder]:
@@ -705,9 +726,20 @@ def export_release_order(order_id: int, file_path: str,
     )
 
 
-def import_release_order(file_path: str, operator: str = "system",
-                     rename_to: Optional[str] = None,
-                     force: bool = False) -> ReleaseOrder:
+def _prepare_import_context(file_path: str, rename_to: Optional[str] = None,
+                          operator: str = "system") -> ImportContext:
+    """统一解析发布单文件，返回结构化 ImportContext。
+
+    负责：
+      - 文件存在性与编码检查
+      - JSON 解析
+      - schema 版本兼容性检查
+      - 发布单名称、目标/源配置名称合法性
+      - 配置数据解析与合法性校验
+    不负责：
+      - 与当前数据库状态相关的冲突校验（交给 _check_import_conflicts）
+      - 落库与审计（交给 _persist_imported_order）
+    """
     if not os.path.exists(file_path):
         raise ValueError(f"发布单文件不存在: {file_path}")
 
@@ -755,20 +787,102 @@ def import_release_order(file_path: str, operator: str = "system",
     if fatal:
         raise ValueError("配置验证失败: " + "; ".join(fatal))
 
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM release_orders WHERE name = ?", (name,))
-    if cursor.fetchone()[0] > 0 and not force:
-        conn.close()
-        raise ValueError(
-            f"发布单 [{name}] 已存在，如需覆盖请指定 force=True"
-        )
-
     rule_version = order_info.get("rule_version", _get_current_rule_version())
     config_json = cfg.to_json()
 
+    history_data = data.get("history", []) or []
+
+    return ImportContext(
+        raw_data=data,
+        order_name=name,
+        source_config_name=source_config_name,
+        target_config_name=target_config_name,
+        description=order_info.get("description", ""),
+        rule_version=rule_version,
+        config=cfg,
+        config_json=config_json,
+        approver=order_info.get("approver"),
+        created_by=order_info.get("created_by", operator),
+        created_at=order_info.get("created_at", datetime.now().isoformat()),
+        approved_at=order_info.get("approved_at"),
+        published_at=order_info.get("published_at"),
+        history_data=history_data,
+    )
+
+
+def _check_import_conflicts(ctx: ImportContext) -> List[str]:
+    """三类冲突统一校验：同名发布单、目标配置已存在、激活配置漂移、规则版本落后。
+
+    返回冲突描述列表。若列表非空，说明存在冲突，调用方应拒绝导入。
+
+    注意：
+      - 此函数只做纯校验，不修改任何状态。
+      - "同名发布单"冲突允许调用方通过 force=True 绕过（由 _persist_imported_order 处理），
+        但"目标配置已存在/激活配置漂移/规则版本落后"三类一律拒绝，不可强制。
+    """
+    conflicts: List[str] = []
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM release_orders WHERE name = ?", (ctx.order_name,))
+    if cursor.fetchone()[0] > 0:
+        conflicts.append(f"发布单 [{ctx.order_name}] 已存在")
+
+    if ec.config_exists(ctx.target_config_name):
+        conflicts.append(
+            f"目标配置 [{ctx.target_config_name}] 已存在，"
+            f"导入被拦截（不可强制，请更换目标配置名称）"
+        )
+
+    active_name = ec.get_active_config_name()
+    if active_name == ctx.target_config_name:
+        current_config, _ = _get_config_hash(ctx.target_config_name)
+        if current_config is not None:
+            diff = _compute_diff(current_config, ctx.config_json)
+            if diff["has_diff"]:
+                conflicts.append(
+                    f"当前激活配置 [{ctx.target_config_name}] 已被修改，与发布单配置存在差异，"
+                    f"导入被拦截（不可强制）"
+                )
+
+    current_rule_version = _get_current_rule_version()
+    if ctx.rule_version < current_rule_version:
+        conflicts.append(
+            f"规则版本落后：发布单规则版本=v{ctx.rule_version}，"
+            f"当前规则版本=v{current_rule_version}，"
+            f"导入被拦截（不可强制，请重新导出发布单）"
+        )
+
+    conn.close()
+    return conflicts
+
+
+def _persist_imported_order(ctx: ImportContext, operator: str,
+                           force: bool = False,
+                           source_file: Optional[str] = None) -> ReleaseOrder:
+    """统一落库入口：写入 release_orders、写入历史、记录审计日志。
+
+    参数：
+      ctx        - 由 _prepare_import_context 返回的结构化上下文
+      operator   - 当前操作人
+      force      - 是否允许覆盖同名发布单（仅对"同名"冲突生效；其他三类冲突
+                   必须已由 _check_import_conflicts 排除）
+      source_file- 源文件名，用于审计日志（可选）
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) FROM release_orders WHERE name = ?", (ctx.order_name,))
+    name_exists = cursor.fetchone()[0] > 0
+
+    if name_exists and not force:
+        conn.close()
+        raise ValueError(
+            f"发布单 [{ctx.order_name}] 已存在，如需覆盖请指定 force=True"
+        )
+
     if force:
-        cursor.execute("DELETE FROM release_orders WHERE name = ?", (name,))
+        cursor.execute("DELETE FROM release_orders WHERE name = ?", (ctx.order_name,))
 
     cursor.execute('''
         INSERT INTO release_orders
@@ -777,39 +891,79 @@ def import_release_order(file_path: str, operator: str = "system",
          approved_at, published_at)
         VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
-        name,
-        order_info.get("description", ""),
-        source_config_name,
-        target_config_name,
-        config_json,
-        rule_version,
-        order_info.get("approver"),
-        order_info.get("created_by", operator),
-        order_info.get("created_at", datetime.now().isoformat()),
-        order_info.get("approved_at"),
-        order_info.get("published_at"),
+        ctx.order_name,
+        ctx.description,
+        ctx.source_config_name,
+        ctx.target_config_name,
+        ctx.config_json,
+        ctx.rule_version,
+        ctx.approver,
+        ctx.created_by,
+        ctx.created_at,
+        ctx.approved_at,
+        ctx.published_at,
     ))
     order_id = cursor.lastrowid
     conn.commit()
     conn.close()
 
+    file_desc = f"从文件 {os.path.basename(source_file)} 导入发布单" if source_file else "创建发布单"
     _add_history(
-        order_id, "import", operator,
-        f"从文件 {os.path.basename(file_path)} 导入发布单",
-        to_config=config_json
+        order_id, "import" if source_file else "create", operator,
+        f"{file_desc}，源配置=[{ctx.source_config_name}], 目标配置=[{ctx.target_config_name}]",
+        to_config=ctx.config_json
     )
 
     log_operation(
-        operation='release_order_import',
+        operation='release_order_import' if source_file else 'release_order_create',
         operator=operator,
         details=(
-            f"导入发布单 [{name}]：源配置=[{source_config_name}], "
-            f"目标配置=[{target_config_name}]"
+            f"{'导入' if source_file else '创建'}发布单 [{ctx.order_name}]："
+            f"源配置=[{ctx.source_config_name}], "
+            f"目标配置=[{ctx.target_config_name}]"
         ),
-        rule_version=rule_version,
+        rule_version=ctx.rule_version,
     )
 
     return get_release_order(order_id)
+
+
+def import_release_order(file_path: str, operator: str = "system",
+                     rename_to: Optional[str] = None,
+                     force: bool = False) -> ReleaseOrder:
+    """对外统一导入入口：串起解析 → 冲突校验 → 落库。
+
+    冲突策略：
+      - 同名发布单：force=True 可覆盖
+      - 目标配置已存在：一律拒绝
+      - 激活配置被他人改动：一律拒绝
+      - 规则版本落后：一律拒绝
+    被拒绝时不会落库任何 draft 数据。
+    """
+    ctx = _prepare_import_context(file_path, rename_to=rename_to, operator=operator)
+
+    conflicts = _check_import_conflicts(ctx)
+
+    hard_conflicts = [c for c in conflicts if "已存在" not in c or "目标配置" in c]
+    name_conflict = any(c.startswith(f"发布单 [{ctx.order_name}] 已存在") for c in conflicts)
+
+    if name_conflict and force:
+        hard_conflicts = [c for c in hard_conflicts if not c.startswith(f"发布单 [{ctx.order_name}] 已存在")]
+
+    if hard_conflicts:
+        log_operation(
+            operation='release_order_import_failed',
+            operator=operator,
+            details=(
+                f"导入发布单 [{ctx.order_name}] 被冲突拦截：{'; '.join(hard_conflicts)}"
+            ),
+            rule_version=ctx.rule_version,
+        )
+        raise ValueError(
+            "导入被拦截，存在以下冲突：\n  - " + "\n  - ".join(hard_conflicts)
+        )
+
+    return _persist_imported_order(ctx, operator=operator, force=force, source_file=file_path)
 
 
 def delete_release_order(order_id: int, operator: str = "system") -> None:
