@@ -12,6 +12,7 @@ from . import exporter
 from . import sampler
 from . import rules
 from . import audit
+from . import export_config as ec
 
 init(autoreset=True)
 
@@ -353,11 +354,16 @@ def review_batches():
     click.echo(tabulate(table_data, headers=headers, tablefmt="simple"))
 
 
-@cli.command(help="导出脱敏后的语料")
+@cli.command(help="导出脱敏后的语料（支持 CSV/JSONL 和字段策略配置）")
 @click.argument('output_path', type=click.Path())
-@click.option('--include-original', is_flag=True, help="包含原文（敏感！请谨慎使用）")
+@click.option('--include-original', is_flag=True, help="包含原文（敏感！请谨慎使用，兼容旧参数）")
+@click.option('--format', 'fmt', default=None, type=click.Choice(['csv', 'jsonl']),
+              help="指定导出格式（默认按已保存配置，其次按扩展名）")
+@click.option('--include-summary', is_flag=True, help="包含复核摘要字段")
+@click.option('--use-config', is_flag=True, help="使用数据库中已保存的导出配置")
+@click.option('--config-name', default="default", help="配置名称，默认 default")
 @click.option('--operator', default="admin", help="操作人")
-def export(output_path, include_original, operator):
+def export(output_path, include_original, fmt, include_summary, use_config, config_name, operator):
     try:
         ready, pending, conflicts = exporter.check_export_ready()
         if not ready:
@@ -367,10 +373,49 @@ def export(output_path, include_original, operator):
             if conflicts > 0:
                 _print_warning(f"  - {conflicts} 个冲突未解决")
             sys.exit(1)
-        count = exporter.export_desensitized(output_path, include_original=include_original, operator=operator)
-        _print_success(f"成功导出 {count} 条脱敏语料到 {output_path}")
 
-        if include_original:
+        override_cfg = None
+        if not use_config:
+            cfg, warnings = ec.load_config(config_name)
+            for w in warnings:
+                _print_warning(w)
+            override_cfg = cfg
+            if include_original:
+                override_cfg.field_policies["original_text"] = ec.FieldPolicy.KEEP.value
+            if fmt:
+                override_cfg.format = fmt
+            if include_summary:
+                override_cfg.include_review_summary = True
+                override_cfg.field_policies["review_summary"] = ec.FieldPolicy.KEEP.value
+            valid, errs = override_cfg.validate()
+            fatal = [e for e in errs if "安全提示" not in e]
+            safety = [e for e in errs if "安全提示" in e]
+            for s in safety:
+                _print_warning(s)
+            if fatal:
+                for e in fatal:
+                    _print_error(e)
+                sys.exit(1)
+            count = exporter.export_desensitized(
+                output_path, operator=operator, config=override_cfg
+            )
+        else:
+            count = exporter.export_desensitized(
+                output_path, operator=operator,
+                use_saved_config=True, config_name=config_name
+            )
+
+        fields_hint = ""
+        if override_cfg:
+            ef = override_cfg.get_effective_fields()
+            fields_hint = f"，字段数={len(ef)}"
+        _print_success(f"成功导出 {count} 条脱敏语料到 {output_path}{fields_hint}")
+
+        exporting_original = (
+            (override_cfg and override_cfg.field_policies.get("original_text") == ec.FieldPolicy.KEEP.value)
+            or include_original
+        )
+        if exporting_original:
             _print_warning("警告：导出文件包含原文敏感数据，请妥善保管！")
         else:
             issues = exporter.check_sensitive_leakage(output_path)
@@ -380,12 +425,223 @@ def export(output_path, include_original, operator):
                     _print_warning(f"  - {issue}")
             else:
                 _print_success("脱敏文件完整性校验通过，未检测到敏感信息泄露")
+
+        stats = exporter.build_review_stats()
+        _print_info(
+            f"复核统计：总语料 {stats['total_corpus']} 条，"
+            f"通过 {stats['by_final_conclusion'].get('approved', 0)}，"
+            f"拒绝 {stats['by_final_conclusion'].get('rejected', 0)}，"
+            f"未解决冲突 {stats['unresolved_conflicts']}"
+        )
     except ValueError as e:
         _print_error(str(e))
         sys.exit(1)
     except Exception as e:
         _print_error(f"导出失败: {str(e)}")
         sys.exit(1)
+
+
+@cli.group(help="导出配置管理（字段策略/格式/复核摘要）")
+def export_config():
+    pass
+
+
+@export_config.command("show", help="查看当前导出配置")
+@click.option('--config-name', default="default", help="配置名称")
+def export_config_show(config_name):
+    cfg, warnings = ec.load_config(config_name)
+    for w in warnings:
+        _print_warning(w)
+    if cfg is None:
+        _print_error("无法加载配置")
+        sys.exit(1)
+    click.echo("\n" + cfg.summary_text())
+    click.echo("\n" + Fore.CYAN + "完整 JSON:" + Style.RESET_ALL)
+    click.echo(cfg.to_json())
+
+
+@export_config.command("fields", help="列出所有可配置字段及其当前策略")
+@click.option('--config-name', default="default", help="配置名称")
+def export_config_fields(config_name):
+    cfg, _ = ec.load_config(config_name)
+    table_data = []
+    for f in ec.ALL_EXPORTABLE_FIELDS:
+        policy = cfg.field_policies.get(f, "-")
+        required = "是" if f in ec.REQUIRED_FIELDS else ""
+        desc = {
+            "id": "语料ID",
+            "original_text": "原始文本（含敏感信息）",
+            "desensitized_text": "脱敏后的文本",
+            "source_file": "来源文件名",
+            "status": "语料状态",
+            "rule_version": "脱敏使用的规则版本",
+            "created_at": "创建时间",
+            "updated_at": "更新时间",
+            "is_sampled": "是否进入抽检",
+            "sample_batch": "抽检批次",
+            "final_conclusion": "复核最终结论",
+            "review_summary": "复核摘要（复核人/结论/冲突信息）",
+        }.get(f, "")
+        color = Fore.GREEN if policy == ec.FieldPolicy.KEEP.value else Fore.RED
+        table_data.append([
+            f, color + policy + Style.RESET_ALL, required, desc,
+        ])
+    click.echo(tabulate(table_data, headers=["字段名", "策略", "必填", "说明"], tablefmt="simple"))
+
+
+@export_config.command("keep", help="将指定字段标记为保留（可多个，逗号分隔）")
+@click.argument('fields')
+@click.option('--config-name', default="default", help="配置名称")
+@click.option('--operator', default="admin", help="操作人")
+def export_config_keep(fields, config_name, operator):
+    cfg, _ = ec.load_config(config_name)
+    flist = [x.strip() for x in fields.split(",")]
+    unknown = [f for f in flist if f not in ec.ALL_EXPORTABLE_FIELDS]
+    if unknown:
+        _print_error(f"未知字段: {', '.join(unknown)}")
+        sys.exit(1)
+    for f in flist:
+        cfg.field_policies[f] = ec.FieldPolicy.KEEP.value
+    ok, errs, warns = ec.save_config(cfg, config_name, operator)
+    for w in warns:
+        _print_warning(w)
+    if not ok:
+        for e in errs:
+            _print_error(e)
+        sys.exit(1)
+    _print_success(f"已将 {flist} 标记为保留并保存")
+
+
+@export_config.command("drop", help="将指定字段标记为删除（可多个，逗号分隔）")
+@click.argument('fields')
+@click.option('--config-name', default="default", help="配置名称")
+@click.option('--operator', default="admin", help="操作人")
+def export_config_drop(fields, config_name, operator):
+    cfg, _ = ec.load_config(config_name)
+    flist = [x.strip() for x in fields.split(",")]
+    unknown = [f for f in flist if f not in ec.ALL_EXPORTABLE_FIELDS]
+    if unknown:
+        _print_error(f"未知字段: {', '.join(unknown)}")
+        sys.exit(1)
+    for f in flist:
+        if f in ec.REQUIRED_FIELDS:
+            _print_warning(f"字段 [{f}] 为必填，不能删除，已忽略")
+            continue
+        cfg.field_policies[f] = ec.FieldPolicy.DROP.value
+    ok, errs, warns = ec.save_config(cfg, config_name, operator)
+    for w in warns:
+        _print_warning(w)
+    if not ok:
+        for e in errs:
+            _print_error(e)
+        sys.exit(1)
+    _print_success(f"已将 {[f for f in flist if f not in ec.REQUIRED_FIELDS]} 标记为删除并保存")
+
+
+@export_config.command("format", help="设置导出格式")
+@click.argument('fmt', type=click.Choice(['csv', 'jsonl']))
+@click.option('--config-name', default="default", help="配置名称")
+@click.option('--operator', default="admin", help="操作人")
+def export_config_format(fmt, config_name, operator):
+    cfg, _ = ec.load_config(config_name)
+    cfg.format = fmt
+    ok, errs, warns = ec.save_config(cfg, config_name, operator)
+    for w in warns:
+        _print_warning(w)
+    if not ok:
+        for e in errs:
+            _print_error(e)
+        sys.exit(1)
+    _print_success(f"导出格式已设为 {fmt.upper()} 并保存")
+
+
+@export_config.command("summary", help="开启/关闭复核摘要")
+@click.argument('switch', type=click.Choice(['on', 'off']))
+@click.option('--config-name', default="default", help="配置名称")
+@click.option('--operator', default="admin", help="操作人")
+def export_config_summary(switch, config_name, operator):
+    cfg, _ = ec.load_config(config_name)
+    enabled = switch == "on"
+    cfg.include_review_summary = enabled
+    cfg.field_policies["review_summary"] = (
+        ec.FieldPolicy.KEEP.value if enabled else ec.FieldPolicy.DROP.value
+    )
+    ok, errs, warns = ec.save_config(cfg, config_name, operator)
+    for w in warns:
+        _print_warning(w)
+    if not ok:
+        for e in errs:
+            _print_error(e)
+        sys.exit(1)
+    _print_success(f"复核摘要已{'开启' if enabled else '关闭'}并保存")
+
+
+@export_config.command("save", help="按当前设置保存完整配置（带交互式 JSON 覆盖能力）")
+@click.option('--config-name', default="default", help="配置名称")
+@click.option('--json', 'json_in', default=None, type=click.Path(exists=True),
+              help="从 JSON 文件读取完整配置覆盖保存")
+@click.option('--operator', default="admin", help="操作人")
+def export_config_save(config_name, json_in, operator):
+    if json_in:
+        ok, errs, warns = ec.import_config_from_file(json_in, config_name, operator)
+        for w in warns:
+            _print_warning(w)
+        if not ok:
+            for e in errs:
+                _print_error(e)
+            sys.exit(1)
+        _print_success(f"已从 {json_in} 导入并保存配置")
+        return
+    cfg, _ = ec.load_config(config_name)
+    ok, errs, warns = ec.save_config(cfg, config_name, operator)
+    for w in warns:
+        _print_warning(w)
+    if not ok:
+        for e in errs:
+            _print_error(e)
+        sys.exit(1)
+    _print_success("当前配置已保存")
+
+
+@export_config.command("reset", help="重置为默认配置（CSV 格式，保留核心字段）")
+@click.option('--config-name', default="default", help="配置名称")
+@click.option('--operator', default="admin", help="操作人")
+def export_config_reset(config_name, operator):
+    ok, msgs = ec.reset_config(config_name, operator)
+    for m in msgs:
+        _print_warning(m)
+    if not ok:
+        _print_error("重置配置失败")
+        sys.exit(1)
+    _print_success("已重置为默认导出配置")
+
+
+@export_config.command("to-file", help="将当前配置导出为 JSON 文件")
+@click.argument('file_path', type=click.Path())
+@click.option('--config-name', default="default", help="配置名称")
+@click.option('--operator', default="admin", help="操作人")
+def export_config_to_file(file_path, config_name, operator):
+    ok, errs = ec.export_config_to_file(file_path, config_name, operator)
+    if not ok:
+        for e in errs:
+            _print_error(e)
+        sys.exit(1)
+    _print_success(f"配置已导出到 {file_path}")
+
+
+@export_config.command("from-file", help="从 JSON 文件导入配置（含旧版兼容迁移）")
+@click.argument('file_path', type=click.Path(exists=True))
+@click.option('--config-name', default="default", help="目标配置名称")
+@click.option('--operator', default="admin", help="操作人")
+def export_config_from_file(file_path, config_name, operator):
+    ok, errs, warns = ec.import_config_from_file(file_path, config_name, operator)
+    for w in warns:
+        _print_warning(w)
+    if not ok:
+        for e in errs:
+            _print_error(e)
+        sys.exit(1)
+    _print_success(f"已从 {file_path} 导入配置")
 
 
 @cli.command(help="查看审计日志")

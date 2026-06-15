@@ -101,6 +101,18 @@ def init_db():
         )
     ''')
 
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS export_configs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            config_name TEXT NOT NULL DEFAULT 'default',
+            config_json TEXT NOT NULL,
+            is_active INTEGER DEFAULT 0,
+            created_at TEXT,
+            updated_at TEXT,
+            UNIQUE(config_name)
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
