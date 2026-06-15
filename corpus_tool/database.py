@@ -113,6 +113,33 @@ def init_db():
         )
     ''')
 
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT,
+            rule_version INTEGER DEFAULT 0,
+            export_config_name TEXT,
+            corpus_count INTEGER DEFAULT 0,
+            review_count INTEGER DEFAULT 0,
+            conflict_count INTEGER DEFAULT 0,
+            created_at TEXT,
+            created_by TEXT
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS snapshot_data (
+            snapshot_id INTEGER PRIMARY KEY,
+            corpus_json TEXT,
+            review_records_json TEXT,
+            conflict_records_json TEXT,
+            export_config_json TEXT,
+            sample_batches_json TEXT,
+            FOREIGN KEY (snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE
+        )
+    ''')
+
     conn.commit()
     conn.close()
 

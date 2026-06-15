@@ -131,3 +131,32 @@ class ConflictRecord:
             resolved=bool(row[6]),
             created_at=row[7],
         )
+
+
+@dataclass
+class Snapshot:
+    id: Optional[int] = None
+    name: str = ""
+    description: str = ""
+    rule_version: int = 0
+    export_config_name: str = ""
+    corpus_count: int = 0
+    review_count: int = 0
+    conflict_count: int = 0
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    created_by: str = ""
+
+    @classmethod
+    def from_row(cls, row):
+        return cls(
+            id=row[0],
+            name=row[1],
+            description=row[2],
+            rule_version=row[3],
+            export_config_name=row[4],
+            corpus_count=row[5],
+            review_count=row[6],
+            conflict_count=row[7],
+            created_at=row[8],
+            created_by=row[9],
+        )

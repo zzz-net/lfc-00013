@@ -13,6 +13,7 @@ from . import sampler
 from . import rules
 from . import audit
 from . import export_config as ec
+from . import snapshot as snap
 
 init(autoreset=True)
 
@@ -751,6 +752,233 @@ def export_config_from_file(file_path, config_name, as_new, overwrite, operator)
             _print_error(e)
         sys.exit(1)
     _print_success(f"已从 {file_path} 导入配置到方案 [{config_name}]")
+
+
+@cli.group(help="数据集快照与回滚管理")
+def snapshot():
+    pass
+
+
+@snapshot.command("create", help="创建命名快照，保存当前语料状态")
+@click.option('--name', required=True, help="快照名称")
+@click.option('--description', default="", help="快照描述")
+@click.option('--operator', default="admin", help="操作人")
+def snapshot_create(name, description, operator):
+    try:
+        s = snap.create_snapshot(name, description=description, operator=operator)
+        _print_success(
+            f"快照创建成功: [{s.name}] "
+            f"(语料 {s.corpus_count} 条, "
+            f"复核 {s.review_count} 条, "
+            f"冲突 {s.conflict_count} 条, "
+            f"规则 v{s.rule_version})"
+        )
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@snapshot.command("list", help="列出所有快照")
+def snapshot_list():
+    data = snap.list_snapshots()
+    if not data:
+        _print_info("没有找到任何快照")
+        return
+    table_data = []
+    for s in data:
+        table_data.append([
+            s.id, s.name,
+            f"v{s.rule_version}",
+            s.export_config_name or "-",
+            s.corpus_count,
+            s.review_count,
+            s.conflict_count,
+            s.created_by,
+            s.created_at,
+        ])
+    headers = ["ID", "名称", "规则版本", "导出配置", "语料数", "复核数", "冲突数", "创建人", "创建时间"]
+    click.echo(tabulate(table_data, headers=headers, tablefmt="simple"))
+
+
+@snapshot.command("show", help="查看快照详情")
+@click.argument('name_or_id')
+def snapshot_show(name_or_id):
+    try:
+        if name_or_id.isdigit():
+            s = snap.get_snapshot(int(name_or_id))
+        else:
+            s = snap.get_snapshot_by_name(name_or_id)
+        click.echo(f"\n{Fore.CYAN}=== 快照详情: {s.name} ==={Style.RESET_ALL}")
+        click.echo(f"ID:           {s.id}")
+        click.echo(f"描述:         {s.description or '-'}")
+        click.echo(f"规则版本:     v{s.rule_version}")
+        click.echo(f"导出配置:     {s.export_config_name or '-'}")
+        click.echo(f"语料数:       {s.corpus_count}")
+        click.echo(f"复核记录数:   {s.review_count}")
+        click.echo(f"冲突记录数:   {s.conflict_count}")
+        click.echo(f"创建人:       {s.created_by}")
+        click.echo(f"创建时间:     {s.created_at}")
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@snapshot.command("export", help="导出快照到 JSON 文件")
+@click.argument('name_or_id')
+@click.argument('output_path', type=click.Path())
+@click.option('--operator', default="admin", help="操作人")
+def snapshot_export(name_or_id, output_path, operator):
+    try:
+        if name_or_id.isdigit():
+            s = snap.get_snapshot(int(name_or_id))
+        else:
+            s = snap.get_snapshot_by_name(name_or_id)
+        snap.export_snapshot(s.id, output_path, operator=operator)
+        _print_success(f"快照 [{s.name}] 已导出到 {output_path}")
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@snapshot.command("import", help="从 JSON 文件导入快照")
+@click.argument('file_path', type=click.Path(exists=True))
+@click.option('--rename', default=None, help="重命名导入后的快照")
+@click.option('--overwrite', is_flag=True, help="允许覆盖已存在的同名快照")
+@click.option('--operator', default="admin", help="操作人")
+def snapshot_import(file_path, rename, overwrite, operator):
+    try:
+        s = snap.import_snapshot(
+            file_path, operator=operator,
+            overwrite=overwrite, rename_to=rename
+        )
+        _print_success(
+            f"快照导入成功: [{s.name}] "
+            f"(语料 {s.corpus_count} 条)"
+        )
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@snapshot.command("delete", help="删除快照")
+@click.argument('name_or_id')
+@click.option('--operator', default="admin", help="操作人")
+@click.option('--yes', is_flag=True, help="跳过确认直接删除")
+def snapshot_delete(name_or_id, operator, yes):
+    try:
+        if name_or_id.isdigit():
+            s = snap.get_snapshot(int(name_or_id))
+        else:
+            s = snap.get_snapshot_by_name(name_or_id)
+
+        if not yes:
+            click.echo(f"{Fore.YELLOW}警告：即将删除快照 [{s.name}]，此操作不可撤销！{Style.RESET_ALL}")
+            confirm = click.prompt("请输入快照名称确认删除", default="")
+            if confirm != s.name:
+                _print_error("名称不匹配，已取消删除")
+                sys.exit(1)
+
+        snap.delete_snapshot(s.id, operator=operator)
+        _print_success(f"快照 [{s.name}] 已删除")
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@snapshot.command("preview", help="预览回滚影响")
+@click.argument('name_or_id')
+def snapshot_preview(name_or_id):
+    try:
+        if name_or_id.isdigit():
+            s = snap.get_snapshot(int(name_or_id))
+        else:
+            s = snap.get_snapshot_by_name(name_or_id)
+
+        preview = snap.preview_rollback(s.id)
+
+        click.echo(f"\n{Fore.CYAN}=== 回滚预览: {preview['snapshot_name']} ==={Style.RESET_ALL}")
+        click.echo(f"快照规则版本:   v{preview['snapshot_rule_version']}")
+        click.echo(f"当前规则版本:   v{preview['current_rule_version']}")
+        click.echo(f"快照导出配置:   {preview['snapshot_export_config'] or '-'}")
+        click.echo(f"当前导出配置:   {preview['current_export_config'] or '-'}")
+
+        click.echo(f"\n{Fore.YELLOW}--- 数据变化 ---{Style.RESET_ALL}")
+
+        def fmt_delta(d):
+            if d > 0:
+                return Fore.GREEN + f"+{d}" + Style.RESET_ALL
+            elif d < 0:
+                return Fore.RED + str(d) + Style.RESET_ALL
+            else:
+                return "0"
+
+        click.echo(
+            f"语料:     当前 {preview['corpus']['current']} 条 "
+            f"→ 快照 {preview['corpus']['snapshot']} 条 "
+            f"({fmt_delta(preview['corpus']['delta'])})"
+        )
+        click.echo(
+            f"复核记录: 当前 {preview['review_records']['current']} 条 "
+            f"→ 快照 {preview['review_records']['snapshot']} 条 "
+            f"({fmt_delta(preview['review_records']['delta'])})"
+        )
+        click.echo(
+            f"冲突记录: 当前 {preview['conflict_records']['current']} 条 "
+            f"→ 快照 {preview['conflict_records']['snapshot']} 条 "
+            f"({fmt_delta(preview['conflict_records']['delta'])})"
+        )
+
+        if preview["warnings"]:
+            click.echo(f"\n{Fore.RED}--- 警告 ---{Style.RESET_ALL}")
+            for w in preview["warnings"]:
+                _print_warning(w)
+
+        click.echo()
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@snapshot.command("rollback", help="回滚到指定快照")
+@click.argument('name_or_id')
+@click.option('--operator', default="admin", help="操作人")
+@click.option('--yes', is_flag=True, help="跳过确认直接回滚")
+def snapshot_rollback(name_or_id, operator, yes):
+    try:
+        if name_or_id.isdigit():
+            s = snap.get_snapshot(int(name_or_id))
+        else:
+            s = snap.get_snapshot_by_name(name_or_id)
+
+        preview = snap.preview_rollback(s.id)
+
+        if not yes:
+            click.echo(f"\n{Fore.YELLOW}警告：即将回滚到快照 [{s.name}]，此操作将覆盖当前所有语料数据！{Style.RESET_ALL}")
+            click.echo(f"  语料:     {preview['corpus']['current']} → {preview['corpus']['snapshot']} 条")
+            click.echo(f"  复核记录: {preview['review_records']['current']} → {preview['review_records']['snapshot']} 条")
+            click.echo(f"  冲突记录: {preview['conflict_records']['current']} → {preview['conflict_records']['snapshot']} 条")
+
+            if preview["warnings"]:
+                click.echo(f"\n{Fore.RED}警告信息：{Style.RESET_ALL}")
+                for w in preview["warnings"]:
+                    click.echo(f"  - {w}")
+
+            click.echo()
+            confirm = click.prompt("请输入快照名称确认回滚", default="")
+            if confirm != s.name:
+                _print_error("名称不匹配，已取消回滚")
+                sys.exit(1)
+
+        result = snap.rollback_snapshot(s.id, operator=operator)
+        _print_success(
+            f"回滚成功: [{result['snapshot_name']}] "
+            f"(恢复语料 {result['corpus_restored']} 条, "
+            f"复核记录 {result['review_records_restored']} 条, "
+            f"冲突记录 {result['conflict_records_restored']} 条)"
+        )
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
 
 
 @cli.command(help="查看审计日志")
