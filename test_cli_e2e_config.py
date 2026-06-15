@@ -56,8 +56,8 @@ def main():
     # ---- 1. 初始化并查看默认配置 ----
     run_cmd(["init"], desc="初始化数据库")
     r = run_cmd(["export-config", "show"], desc="查看默认配置")
-    all_pass &= check("CSV" in r.stdout and "默认导出配置" in r.stdout,
-                      "默认配置为 CSV，并提示默认")
+    all_pass &= check("CSV" in r.stdout and "default" in r.stdout and "激活" in r.stdout,
+                      "默认配置为 CSV，显示 default 方案及激活标记")
 
     run_cmd(["export-config", "fields"], desc="列出所有字段策略")
 

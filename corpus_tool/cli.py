@@ -360,11 +360,14 @@ def review_batches():
 @click.option('--format', 'fmt', default=None, type=click.Choice(['csv', 'jsonl']),
               help="指定导出格式（默认按已保存配置，其次按扩展名）")
 @click.option('--include-summary', is_flag=True, help="包含复核摘要字段")
-@click.option('--use-config', is_flag=True, help="使用数据库中已保存的导出配置")
-@click.option('--config-name', default="default", help="配置名称，默认 default")
+@click.option('--use-config', is_flag=True, help="使用数据库中已保存的导出配置（默认使用当前激活方案）")
+@click.option('--config-name', default=None, help="配置名称（不指定则使用当前激活方案）")
 @click.option('--operator', default="admin", help="操作人")
 def export(output_path, include_original, fmt, include_summary, use_config, config_name, operator):
     try:
+        if config_name is None:
+            config_name = ec.get_active_config_name() or "default"
+
         ready, pending, conflicts = exporter.check_export_ready()
         if not ready:
             _print_error(f"导出条件不满足：")
@@ -446,18 +449,109 @@ def export_config():
     pass
 
 
-@export_config.command("show", help="查看当前导出配置")
-@click.option('--config-name', default="default", help="配置名称")
+@export_config.command("show", help="查看导出配置（默认查看当前激活方案）")
+@click.option('--config-name', default=None, help="配置名称（不指定则查看当前激活方案）")
 def export_config_show(config_name):
+    active_name = ec.get_active_config_name()
+    if config_name is None:
+        config_name = active_name or "default"
+
     cfg, warnings = ec.load_config(config_name)
     for w in warnings:
         _print_warning(w)
     if cfg is None:
         _print_error("无法加载配置")
         sys.exit(1)
-    click.echo("\n" + cfg.summary_text())
+
+    is_active = config_name == active_name
+    active_tag = Fore.GREEN + " [当前激活]" + Style.RESET_ALL if is_active else ""
+    click.echo(f"\n{Fore.CYAN}配置方案: {Style.RESET_ALL}{config_name}{active_tag}")
+    click.echo(cfg.summary_text())
     click.echo("\n" + Fore.CYAN + "完整 JSON:" + Style.RESET_ALL)
     click.echo(cfg.to_json())
+
+
+@export_config.command("list", help="列出所有导出配置方案")
+def export_config_list():
+    configs = ec.list_configs()
+    if not configs:
+        _print_info("没有找到任何配置方案")
+        return
+
+    table_data = []
+    for cfg in configs:
+        active_mark = Fore.GREEN + "★" + Style.RESET_ALL if cfg["is_active"] else ""
+        fmt = cfg["format"].upper()
+        table_data.append([
+            active_mark,
+            cfg["name"],
+            fmt,
+            cfg["field_count"],
+            cfg.get("updated_at", "-") or "-",
+        ])
+    headers = ["", "方案名称", "格式", "保留字段数", "更新时间"]
+    click.echo(tabulate(table_data, headers=headers, tablefmt="simple"))
+    click.echo(f"\n共 {len(configs)} 个配置方案，★ 表示当前激活方案")
+
+
+@export_config.command("use", help="切换激活的导出配置方案")
+@click.argument('config_name')
+@click.option('--operator', default="admin", help="操作人")
+def export_config_use(config_name, operator):
+    ok, errs = ec.set_active_config(config_name, operator)
+    if not ok:
+        for e in errs:
+            _print_error(e)
+        sys.exit(1)
+    _print_success(f"已切换到配置方案 [{config_name}]")
+
+
+@export_config.command("copy", help="复制配置方案（基于已有方案新建）")
+@click.argument('source_name')
+@click.argument('target_name')
+@click.option('--operator', default="admin", help="操作人")
+def export_config_copy(source_name, target_name, operator):
+    ok, errs, warns = ec.copy_config(source_name, target_name, operator)
+    for w in warns:
+        _print_warning(w)
+    if not ok:
+        for e in errs:
+            _print_error(e)
+        sys.exit(1)
+    _print_success(f"已复制配置：[{source_name}] -> [{target_name}]")
+
+
+@export_config.command("rename", help="重命名配置方案")
+@click.argument('old_name')
+@click.argument('new_name')
+@click.option('--operator', default="admin", help="操作人")
+def export_config_rename(old_name, new_name, operator):
+    ok, errs = ec.rename_config(old_name, new_name, operator)
+    if not ok:
+        for e in errs:
+            _print_error(e)
+        sys.exit(1)
+    _print_success(f"已重命名配置：[{old_name}] -> [{new_name}]")
+
+
+@export_config.command("delete", help="删除配置方案（不能删除 default）")
+@click.argument('config_name')
+@click.option('--operator', default="admin", help="操作人")
+@click.option('--yes', is_flag=True, help="跳过确认直接删除")
+def export_config_delete(config_name, operator, yes):
+    if not yes:
+        click.echo(f"{Fore.YELLOW}警告：即将删除配置方案 [{config_name}]，此操作不可撤销！{Style.RESET_ALL}")
+        confirm = click.prompt("请输入配置名称确认删除", default="")
+        if confirm != config_name:
+            _print_error("名称不匹配，已取消删除")
+            sys.exit(1)
+
+    ok, errs = ec.delete_config(config_name, operator)
+    if not ok:
+        for e in errs:
+            _print_error(e)
+        sys.exit(1)
+    _print_success(f"已删除配置方案 [{config_name}]")
 
 
 @export_config.command("fields", help="列出所有可配置字段及其当前策略")
@@ -632,16 +726,31 @@ def export_config_to_file(file_path, config_name, operator):
 @export_config.command("from-file", help="从 JSON 文件导入配置（含旧版兼容迁移）")
 @click.argument('file_path', type=click.Path(exists=True))
 @click.option('--config-name', default="default", help="目标配置名称")
+@click.option('--as-new', is_flag=True, help="作为新方案导入（目标名称必须不存在）")
+@click.option('--overwrite', is_flag=True, help="允许覆盖已存在的配置方案")
 @click.option('--operator', default="admin", help="操作人")
-def export_config_from_file(file_path, config_name, operator):
-    ok, errs, warns = ec.import_config_from_file(file_path, config_name, operator)
+def export_config_from_file(file_path, config_name, as_new, overwrite, operator):
+    if as_new and overwrite:
+        _print_error("--as-new 和 --overwrite 不能同时使用")
+        sys.exit(1)
+
+    if as_new:
+        overwrite_val = False
+    elif overwrite:
+        overwrite_val = True
+    else:
+        overwrite_val = (config_name == "default")
+
+    ok, errs, warns = ec.import_config_from_file(
+        file_path, config_name, operator, overwrite=overwrite_val
+    )
     for w in warns:
         _print_warning(w)
     if not ok:
         for e in errs:
             _print_error(e)
         sys.exit(1)
-    _print_success(f"已从 {file_path} 导入配置")
+    _print_success(f"已从 {file_path} 导入配置到方案 [{config_name}]")
 
 
 @cli.command(help="查看审计日志")

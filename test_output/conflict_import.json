@@ -1,0 +1,1 @@
+{"config_version": 1, "include_fields": ["id", "status", "sample_batch"], "exclude_fields": ["status", "sample_batch"]}
