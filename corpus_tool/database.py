@@ -140,6 +140,38 @@ def init_db():
         )
     ''')
 
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS release_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT,
+            status TEXT NOT NULL DEFAULT 'draft',
+            source_config_name TEXT NOT NULL,
+            target_config_name TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            rule_version INTEGER DEFAULT 0,
+            approver TEXT,
+            created_by TEXT NOT NULL,
+            created_at TEXT,
+            approved_at TEXT,
+            published_at TEXT
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS release_order_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            release_order_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            operator TEXT NOT NULL,
+            details TEXT,
+            from_config_json TEXT,
+            to_config_json TEXT,
+            created_at TEXT,
+            FOREIGN KEY (release_order_id) REFERENCES release_orders(id) ON DELETE CASCADE
+        )
+    ''')
+
     conn.commit()
     conn.close()
 

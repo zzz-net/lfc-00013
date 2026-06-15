@@ -160,3 +160,63 @@ class Snapshot:
             created_at=row[8],
             created_by=row[9],
         )
+
+
+@dataclass
+class ReleaseOrder:
+    id: Optional[int] = None
+    name: str = ""
+    description: str = ""
+    status: str = "draft"
+    source_config_name: str = ""
+    target_config_name: str = ""
+    config_json: str = ""
+    rule_version: int = 0
+    approver: Optional[str] = None
+    created_by: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    approved_at: Optional[str] = None
+    published_at: Optional[str] = None
+
+    @classmethod
+    def from_row(cls, row):
+        return cls(
+            id=row[0],
+            name=row[1],
+            description=row[2],
+            status=row[3],
+            source_config_name=row[4],
+            target_config_name=row[5],
+            config_json=row[6],
+            rule_version=row[7],
+            approver=row[8],
+            created_by=row[9],
+            created_at=row[10],
+            approved_at=row[11],
+            published_at=row[12],
+        )
+
+
+@dataclass
+class ReleaseOrderHistory:
+    id: Optional[int] = None
+    release_order_id: int = 0
+    action: str = ""
+    operator: str = ""
+    details: str = ""
+    from_config_json: Optional[str] = None
+    to_config_json: Optional[str] = None
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    @classmethod
+    def from_row(cls, row):
+        return cls(
+            id=row[0],
+            release_order_id=row[1],
+            action=row[2],
+            operator=row[3],
+            details=row[4],
+            from_config_json=row[5],
+            to_config_json=row[6],
+            created_at=row[7],
+        )

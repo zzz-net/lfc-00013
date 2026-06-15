@@ -14,6 +14,7 @@ from . import rules
 from . import audit
 from . import export_config as ec
 from . import snapshot as snap
+from . import release_orders as ro
 
 init(autoreset=True)
 
@@ -976,6 +977,362 @@ def snapshot_rollback(name_or_id, operator, yes):
             f"复核记录 {result['review_records_restored']} 条, "
             f"冲突记录 {result['conflict_records_restored']} 条)"
         )
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@cli.group(help="导出配置发布单管理")
+def release_order():
+    pass
+
+
+@release_order.command("create", help="新建发布单（草稿状态）")
+@click.option('--name', required=True, help="发布单名称")
+@click.option('--source-config', required=True, help="源配置名称")
+@click.option('--target-config', required=True, help="目标配置名称")
+@click.option('--description', default="", help="发布单描述")
+@click.option('--operator', default="admin", help="操作人")
+def release_order_create(name, source_config, target_config, description, operator):
+    try:
+        order = ro.create_release_order(
+            name, source_config, target_config,
+            description=description, operator=operator
+        )
+        _print_success(
+            f"发布单创建成功：[{order.name}] "
+            f"(源=[{order.source_config_name}], 目标=[{order.target_config_name}])"
+        )
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@release_order.command("list", help="列出所有发布单")
+@click.option('--status', default=None, help="按状态过滤：draft/locked/approved/published/reverted")
+def release_order_list(status):
+    orders = ro.list_release_orders(status=status)
+    if not orders:
+        _print_info("没有找到任何发布单")
+        return
+
+    table_data = []
+    status_color = {
+        "draft": Fore.CYAN,
+        "locked": Fore.YELLOW,
+        "approved": Fore.BLUE,
+        "published": Fore.GREEN,
+        "reverted": Fore.MAGENTA,
+    }
+    for o in orders:
+        color = status_color.get(o.status, Fore.WHITE)
+        table_data.append([
+            o.id,
+            o.name,
+            color + o.status + Style.RESET_ALL,
+            o.source_config_name,
+            o.target_config_name,
+            f"v{o.rule_version}",
+            o.approver or "-",
+            o.created_by,
+            o.created_at,
+        ])
+    headers = ["ID", "名称", "状态", "源配置", "目标配置", "规则版本", "审批人", "创建人", "创建时间"]
+    click.echo(tabulate(table_data, headers=headers, tablefmt="simple"))
+    click.echo(f"\n共 {len(orders)} 个发布单")
+
+
+@release_order.command("show", help="查看发布单详情")
+@click.argument('name_or_id')
+@click.option('--show-config', is_flag=True, help="显示完整配置 JSON")
+def release_order_show(name_or_id, show_config):
+    try:
+        if name_or_id.isdigit():
+            order = ro.get_release_order(int(name_or_id))
+        else:
+            order = ro.get_release_order_by_name(name_or_id)
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+    status_color = {
+        "draft": Fore.CYAN,
+        "locked": Fore.YELLOW,
+        "approved": Fore.BLUE,
+        "published": Fore.GREEN,
+        "reverted": Fore.MAGENTA,
+    }
+    color = status_color.get(order.status, Fore.WHITE)
+
+    click.echo(f"\n{Fore.CYAN}=== 发布单详情: {order.name} ==={Style.RESET_ALL}")
+    click.echo(f"ID:           {order.id}")
+    click.echo(f"描述:         {order.description or '-'}")
+    click.echo(f"状态:         {color}{order.status}{Style.RESET_ALL}")
+    click.echo(f"源配置:       {order.source_config_name}")
+    click.echo(f"目标配置:     {order.target_config_name}")
+    click.echo(f"规则版本:     v{order.rule_version}")
+    click.echo(f"创建人:       {order.created_by}")
+    click.echo(f"创建时间:     {order.created_at}")
+    if order.approver:
+        click.echo(f"审批人:       {order.approver}")
+    if order.approved_at:
+        click.echo(f"审批时间:     {order.approved_at}")
+    if order.published_at:
+        click.echo(f"发布时间:     {order.published_at}")
+
+    if show_config:
+        click.echo(f"\n{Fore.CYAN}配置内容:{Style.RESET_ALL}")
+        click.echo(order.config_json)
+
+    try:
+        diff = ro.get_config_diff(order.id)
+        if diff["has_diff"]:
+            click.echo(f"\n{Fore.YELLOW}--- 配置差异（与源配置对比） ---{Style.RESET_ALL}")
+            for c in diff["changes"]:
+                click.echo(f"  {Fore.YELLOW}●{Style.RESET_ALL} {c['field']}: {c['old_value']} → {c['new_value']}")
+            for a in diff["additions"]:
+                click.echo(f"  {Fore.GREEN}+{Style.RESET_ALL} 新增 {a['field']}: {a['new_value']}")
+            for d in diff["deletions"]:
+                click.echo(f"  {Fore.RED}-{Style.RESET_ALL} 删除 {d['field']}")
+        else:
+            click.echo(f"\n{Fore.GREEN}配置与源配置一致，无差异{Style.RESET_ALL}")
+    except ValueError as e:
+        _print_warning(f"无法计算差异: {e}")
+
+    try:
+        history = ro.get_order_history(order.id)
+        if history:
+            click.echo(f"\n{Fore.CYAN}--- 操作历史 ---{Style.RESET_ALL}")
+            for h in history:
+                click.echo(f"  [{h.created_at}] {h.operator} {h.action}: {h.details}")
+    except Exception:
+        pass
+
+
+@release_order.command("diff", help="查看发布单与源配置的差异")
+@click.argument('name_or_id')
+def release_order_diff(name_or_id):
+    try:
+        if name_or_id.isdigit():
+            order = ro.get_release_order(int(name_or_id))
+        else:
+            order = ro.get_release_order_by_name(name_or_id)
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+    try:
+        diff = ro.get_config_diff(order.id)
+        if not diff["has_diff"]:
+            _print_success("配置与源配置一致，无差异")
+            return
+
+        click.echo(f"\n{Fore.CYAN}=== 配置差异：{order.name} ==={Style.RESET_ALL}")
+        click.echo(f"源配置: {order.source_config_name}")
+        click.echo()
+
+        for c in diff["changes"]:
+            click.echo(f"  {Fore.YELLOW}● 修改{Style.RESET_ALL} {c['field']}:")
+            click.echo(f"      旧值: {c['old_value']}")
+            click.echo(f"      新值: {c['new_value']}")
+        for a in diff["additions"]:
+            click.echo(f"  {Fore.GREEN}+ 新增{Style.RESET_ALL} {a['field']}: {a['new_value']}")
+        for d in diff["deletions"]:
+            click.echo(f"  {Fore.RED}- 删除{Style.RESET_ALL} {d['field']}: {d['old_value']}")
+
+        total = len(diff["changes"]) + len(diff["additions"]) + len(diff["deletions"])
+        click.echo(f"\n共 {total} 处差异："
+                   f"{len(diff['changes'])} 处修改, "
+                   f"{len(diff['additions'])} 处新增, "
+                   f"{len(diff['deletions'])} 处删除")
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@release_order.command("update", help="修改草稿状态发布单的配置")
+@click.argument('name_or_id')
+@click.option('--keep', default=None, help="标记为保留的字段，逗号分隔")
+@click.option('--drop', default=None, help="标记为删除的字段，逗号分隔")
+@click.option('--format', 'fmt', default=None, type=click.Choice(['csv', 'jsonl']), help="导出格式")
+@click.option('--summary', type=click.Choice(['on', 'off']), default=None, help="复核摘要开关")
+@click.option('--operator', default="admin", help="操作人")
+def release_order_update(name_or_id, keep, drop, fmt, summary, operator):
+    try:
+        if name_or_id.isdigit():
+            order = ro.get_release_order(int(name_or_id))
+        else:
+            order = ro.get_release_order_by_name(name_or_id)
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+    field_policies = {}
+    if keep:
+        for f in keep.split(","):
+            f = f.strip()
+            if f:
+                field_policies[f] = ec.FieldPolicy.KEEP.value
+    if drop:
+        for f in drop.split(","):
+            f = f.strip()
+            if f:
+                field_policies[f] = ec.FieldPolicy.DROP.value
+
+    include_summary = None
+    if summary == "on":
+        include_summary = True
+    elif summary == "off":
+        include_summary = False
+
+    try:
+        order = ro.update_draft_config(
+            order.id,
+            field_policies=field_policies if field_policies else None,
+            format=fmt,
+            include_review_summary=include_summary,
+            operator=operator
+        )
+        _print_success(f"发布单 [{order.name}] 配置已更新")
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@release_order.command("lock", help="锁定发布单（进入待审批状态）")
+@click.argument('name_or_id')
+@click.option('--operator', default="admin", help="操作人")
+def release_order_lock(name_or_id, operator):
+    try:
+        if name_or_id.isdigit():
+            order = ro.get_release_order(int(name_or_id))
+        else:
+            order = ro.get_release_order_by_name(name_or_id)
+        order = ro.lock_release_order(order.id, operator=operator)
+        _print_success(f"发布单 [{order.name}] 已锁定，等待审批")
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@release_order.command("approve", help="审批通过发布单（需要管理员权限）")
+@click.argument('name_or_id')
+@click.option('--operator', default="admin", help="操作人（需为管理员）")
+def release_order_approve(name_or_id, operator):
+    try:
+        if name_or_id.isdigit():
+            order = ro.get_release_order(int(name_or_id))
+        else:
+            order = ro.get_release_order_by_name(name_or_id)
+        order = ro.approve_release_order(order.id, operator=operator)
+        _print_success(f"发布单 [{order.name}] 已通过审批，可以发布")
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@release_order.command("publish", help="正式发布配置（需要管理员权限）")
+@click.argument('name_or_id')
+@click.option('--force', is_flag=True, help="强制发布（忽略冲突警告）")
+@click.option('--operator', default="admin", help="操作人（需为管理员）")
+def release_order_publish(name_or_id, force, operator):
+    try:
+        if name_or_id.isdigit():
+            order = ro.get_release_order(int(name_or_id))
+        else:
+            order = ro.get_release_order_by_name(name_or_id)
+        result = ro.publish_release_order(
+            order.id, force=force, operator=operator
+        )
+        _print_success(
+            f"发布单 [{result['order_name']}] 发布成功，"
+            f"目标配置=[{result['target_config']}]"
+        )
+        if result.get("conflicts_force"):
+            _print_warning("本次发布已忽略冲突警告")
+        for w in result.get("warnings", []):
+            _print_warning(w)
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@release_order.command("revert", help="撤销已发布的配置（需要管理员权限）")
+@click.argument('name_or_id')
+@click.option('--operator', default="admin", help="操作人（需为管理员）")
+def release_order_revert(name_or_id, operator):
+    try:
+        if name_or_id.isdigit():
+            order = ro.get_release_order(int(name_or_id))
+        else:
+            order = ro.get_release_order_by_name(name_or_id)
+        result = ro.revert_release_order(order.id, operator=operator)
+        _print_success(
+            f"发布单 [{result['order_name']}] 已撤销，"
+            f"目标配置=[{result['target_config']}] 已回滚到发布前版本"
+        )
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@release_order.command("export", help="导出发布单为 JSON 文件")
+@click.argument('name_or_id')
+@click.argument('output_path', type=click.Path())
+@click.option('--operator', default="admin", help="操作人")
+def release_order_export(name_or_id, output_path, operator):
+    try:
+        if name_or_id.isdigit():
+            order = ro.get_release_order(int(name_or_id))
+        else:
+            order = ro.get_release_order_by_name(name_or_id)
+        ro.export_release_order(order.id, output_path, operator=operator)
+        _print_success(f"发布单 [{order.name}] 已导出到 {output_path}")
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@release_order.command("import", help="从 JSON 文件导入发布单")
+@click.argument('file_path', type=click.Path(exists=True))
+@click.option('--rename', default=None, help="重命名导入后的发布单")
+@click.option('--force', is_flag=True, help="覆盖已存在的同名发布单")
+@click.option('--operator', default="admin", help="操作人")
+def release_order_import(file_path, rename, force, operator):
+    try:
+        order = ro.import_release_order(
+            file_path, operator=operator,
+            rename_to=rename, force=force
+        )
+        _print_success(
+            f"发布单导入成功：[{order.name}] "
+            f"(源=[{order.source_config_name}], 目标=[{order.target_config_name}])"
+        )
+    except ValueError as e:
+        _print_error(str(e))
+        sys.exit(1)
+
+
+@release_order.command("delete", help="删除发布单")
+@click.argument('name_or_id')
+@click.option('--operator', default="admin", help="操作人")
+@click.option('--yes', is_flag=True, help="跳过确认直接删除")
+def release_order_delete(name_or_id, operator, yes):
+    try:
+        if name_or_id.isdigit():
+            order = ro.get_release_order(int(name_or_id))
+        else:
+            order = ro.get_release_order_by_name(name_or_id)
+
+        if not yes:
+            click.echo(f"{Fore.YELLOW}警告：即将删除发布单 [{order.name}]，此操作不可撤销！{Style.RESET_ALL}")
+            confirm = click.prompt("请输入发布单名称确认删除", default="")
+            if confirm != order.name:
+                _print_error("名称不匹配，已取消删除")
+                sys.exit(1)
+
+        ro.delete_release_order(order.id, operator=operator)
+        _print_success(f"发布单 [{order.name}] 已删除")
     except ValueError as e:
         _print_error(str(e))
         sys.exit(1)
