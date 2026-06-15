@@ -139,7 +139,17 @@ def submit_review(corpus_id: int, reviewer: str, conclusion: str, comment: str =
     }
 
     log_op = None
-    if len(existing_reviews) == 1:
+    if len(existing_reviews) == 0:
+        cursor.execute('''
+            UPDATE corpus
+            SET status = 'single_review', updated_at = datetime('now')
+            WHERE id = ?
+        ''', (corpus_id,))
+        result['status'] = 'single_review'
+        log_op = ('review_submit', operator or reviewer,
+                  f'语料 {corpus_id} 提交复核，结论: {conclusion}',
+                  version)
+    elif len(existing_reviews) == 1:
         first_review = existing_reviews[0]
         if first_review[2] != conclusion:
             cursor.execute('''
@@ -147,6 +157,11 @@ def submit_review(corpus_id: int, reviewer: str, conclusion: str, comment: str =
                 (corpus_id, reviewer1, reviewer2, conclusion1, conclusion2, created_at)
                 VALUES (?, ?, ?, ?, ?, datetime('now'))
             ''', (corpus_id, first_review[1], reviewer, first_review[2], conclusion))
+            cursor.execute('''
+                UPDATE corpus
+                SET status = 'conflict', updated_at = datetime('now')
+                WHERE id = ?
+            ''', (corpus_id,))
             result['status'] = 'conflict'
             result['conflict'] = True
             result['conflict_with'] = first_review[1]

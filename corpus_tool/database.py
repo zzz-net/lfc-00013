@@ -124,7 +124,7 @@ def ensure_default_rules():
             ("固定电话脱敏", "landline", r"\d{3,4}-\d{7,8}", "****-****", "匹配固定电话号码"),
             ("邮箱地址脱敏", "email", r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", "***@***.com", "匹配邮箱地址"),
             ("银行卡号脱敏", "bank_card", r"\d{16,19}", "**** **** **** ****", "匹配16-19位银行卡号"),
-            ("地址脱敏", "address", r"[北京市|上海市|广州市|深圳市|杭州市|南京市|成都市|武汉市|西安市|重庆市][市区][^，。！？；]{2,20}", "**市**区", "匹配常见城市地址片段"),
+            ("地址脱敏", "address", r"(北京市|上海市|广州市|深圳市|杭州市|南京市|成都市|武汉市|西安市|重庆市|天津市|苏州市|郑州市|长沙市|沈阳市|青岛市|宁波市|东莞市|无锡市|合肥市|福州市|厦门市|济南市|哈尔滨市|长春市|石家庄市|太原市|南昌市|南宁市|昆明市|贵阳市|兰州市|乌鲁木齐市|呼和浩特市|拉萨市|西宁市|银川市|海口市)([市区][^，。！？；\n]{2,20}|[^，。！？；\n]{2,30})", "**市**区", "匹配常见城市地址片段"),
             ("姓名脱敏", "name", r"(先生|女士|小姐|同志|老师)\s*[:：]\s*[\u4e00-\u9fa5]{2,4}", "***:", "匹配带称谓的姓名"),
         ]
         for name, category, pattern, replacement, desc in default_rules:
@@ -138,4 +138,19 @@ def ensure_default_rules():
             VALUES (1, '初始默认规则集', datetime('now'), 1)
         ''')
         conn.commit()
+    else:
+        cursor.execute("SELECT id, pattern FROM desensitization_rules WHERE category = 'address'")
+        address_rules = cursor.fetchall()
+        fixed_pattern = r"(北京市|上海市|广州市|深圳市|杭州市|南京市|成都市|武汉市|西安市|重庆市|天津市|苏州市|郑州市|长沙市|沈阳市|青岛市|宁波市|东莞市|无锡市|合肥市|福州市|厦门市|济南市|哈尔滨市|长春市|石家庄市|太原市|南昌市|南宁市|昆明市|贵阳市|兰州市|乌鲁木齐市|呼和浩特市|拉萨市|西宁市|银川市|海口市)([市区][^，。！？；\n]{2,20}|[^，。！？；\n]{2,30})"
+        need_update = False
+        for rule_id, current_pattern in address_rules:
+            if '[市区]' in current_pattern and '|[' not in current_pattern:
+                need_update = True
+                cursor.execute('''
+                    UPDATE desensitization_rules 
+                    SET pattern = ?
+                    WHERE id = ?
+                ''', (fixed_pattern, rule_id))
+        if need_update:
+            conn.commit()
     conn.close()

@@ -1,0 +1,5 @@
+﻿id,desensitized_text,source_file,rule_version,final_conclusion
+1,客服对话1：用户咨询退款，手机号***-****-****，身份证110101***-****-****1，地址**市**区,regression_samples.txt,1,approved
+3,客服对话3：用户咨询退款，手机号***-****-****，身份证110101***-****-****3，地址**市**区,regression_samples.txt,1,approved
+4,客服对话4：用户咨询退款，手机号***-****-****，身份证110101***-****-****4，地址**市**区,regression_samples.txt,1,approved
+5,客服对话5：用户咨询退款，手机号***-****-****，身份证110101***-****-****5，地址**市**区,regression_samples.txt,1,approved

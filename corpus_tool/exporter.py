@@ -37,7 +37,10 @@ def export_desensitized(output_path: str, include_original: bool = False, operat
     cursor.execute('''
         SELECT id, original_text, desensitized_text, source_file, status, rule_version,
                created_at, updated_at, is_sampled, sample_batch, final_conclusion, metadata
-        FROM corpus WHERE status = 'desensitized' ORDER BY id
+        FROM corpus 
+        WHERE status = 'desensitized' 
+           OR (status = 'reviewed' AND final_conclusion = 'approved')
+        ORDER BY id
     ''')
     rows = cursor.fetchall()
 
